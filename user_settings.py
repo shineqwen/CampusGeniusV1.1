@@ -67,31 +67,59 @@ class UserSettings:
 
 class UserSettingsManager:
     def __init__(self, mongodb_uri: str = None):
-        """Initialize with MongoDB connection"""
+        """Initialize with MongoDB connection (lazy loading)"""
         if mongodb_uri is None:
             mongodb_uri = os.getenv("MONGODB_URI")
         
         if not mongodb_uri:
             raise ValueError("MONGODB_URI environment variable not set")
         
-        try:
-            self.client = MongoClient(mongodb_uri)
-            self.db = self.client.get_database("campus_genius_bot")
-            self.collection = self.db.user_settings
-            
-            # Create index on user_id for faster queries
-            self.collection.create_index("user_id", unique=True)
-            
-            logger.info("Connected to MongoDB successfully")
-        except Exception as e:
-            logger.error(f"Failed to connect to MongoDB: {e}")
-            raise
-        
+        self.mongodb_uri = mongodb_uri
+        self.client = None
+        self.db = None
+        self.collection = None
         self.settings: Dict[int, UserSettings] = {}
-        self.load_settings()
+        
+        # Don't connect immediately - connect on first use
+        logger.info("MongoDB connection initialized (will connect on first use)")
+    
+    def _ensure_connection(self):
+        """Ensure MongoDB connection is established"""
+        if self.client is None:
+            try:
+                # Use more compatible connection settings
+                self.client = MongoClient(
+                    self.mongodb_uri,
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=10000,
+                    socketTimeoutMS=10000,
+                    tls=True,
+                    tlsAllowInvalidCertificates=True
+                )
+                self.db = self.client.get_database("campus_genius_bot")
+                self.collection = self.db.user_settings
+                
+                # Test connection
+                self.client.admin.command('ping')
+                
+                # Create index on user_id for faster queries
+                self.collection.create_index("user_id", unique=True)
+                
+                logger.info("Connected to MongoDB successfully")
+                
+                # Load settings after successful connection
+                self.load_settings()
+            except Exception as e:
+                logger.error(f"Failed to connect to MongoDB: {e}")
+                # Use in-memory fallback
+                logger.warning("Using in-memory storage - data will not persist!")
+                self.settings = {}
     
     def load_settings(self):
         """Load all user settings from MongoDB into memory"""
+        if self.collection is None:
+            return
+        
         try:
             documents = self.collection.find()
             
@@ -113,6 +141,12 @@ class UserSettingsManager:
     
     def _save_user_to_db(self, settings: UserSettings):
         """Save a single user's settings to MongoDB"""
+        self._ensure_connection()
+        
+        if self.collection is None:
+            logger.warning("MongoDB not connected - settings not persisted")
+            return
+        
         try:
             settings_dict = asdict(settings)
             
