@@ -1,11 +1,10 @@
-import sqlite3
 import logging
 import os
-import json
 from datetime import datetime
 from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict
 from zoneinfo import ZoneInfo
+from pymongo import MongoClient
 
 logger = logging.getLogger("alfred.user_settings")
 
@@ -67,112 +66,65 @@ class UserSettings:
             return ZoneInfo("UTC")
 
 class UserSettingsManager:
-    def __init__(self, db_path: str = "user_settings.db"):
-        """Initialize with SQLite database instead of JSON"""
-        # Use DATA_DIR environment variable if set (for Railway)
-        data_dir = os.getenv("DATA_DIR", ".")
-        self.db_path = os.path.join(data_dir, db_path)
+    def __init__(self, mongodb_uri: str = None):
+        """Initialize with MongoDB connection"""
+        if mongodb_uri is None:
+            mongodb_uri = os.getenv("MONGODB_URI")
         
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(self.db_path) if os.path.dirname(self.db_path) else ".", exist_ok=True)
+        if not mongodb_uri:
+            raise ValueError("MONGODB_URI environment variable not set")
+        
+        try:
+            self.client = MongoClient(mongodb_uri)
+            self.db = self.client.get_database("campus_genius_bot")
+            self.collection = self.db.user_settings
+            
+            # Create index on user_id for faster queries
+            self.collection.create_index("user_id", unique=True)
+            
+            logger.info("Connected to MongoDB successfully")
+        except Exception as e:
+            logger.error(f"Failed to connect to MongoDB: {e}")
+            raise
         
         self.settings: Dict[int, UserSettings] = {}
-        self._init_database()
         self.load_settings()
     
-    def _init_database(self):
-        """Create database table if it doesn't exist"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_settings (
-                    user_id INTEGER PRIMARY KEY,
-                    daily_reminders INTEGER DEFAULT 1,
-                    event_reminders INTEGER DEFAULT 1,
-                    morning_time TEXT DEFAULT '07:00',
-                    evening_time TEXT DEFAULT '21:00',
-                    event_reminder_minutes INTEGER DEFAULT 20,
-                    timezone TEXT DEFAULT 'Europe/London',
-                    course_code TEXT DEFAULT 'BS1',
-                    created_at TEXT,
-                    updated_at TEXT
-                )
-            """)
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"Database initialized at {self.db_path}")
-        except Exception as e:
-            logger.error(f"Failed to initialize database: {e}")
-    
     def load_settings(self):
-        """Load all user settings from database into memory"""
+        """Load all user settings from MongoDB into memory"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            documents = self.collection.find()
             
-            cursor.execute("SELECT * FROM user_settings")
-            rows = cursor.fetchall()
+            for doc in documents:
+                user_id = doc['user_id']
+                # Remove MongoDB's _id field
+                doc.pop('_id', None)
+                
+                self.settings[user_id] = UserSettings(**doc)
             
-            for row in rows:
-                user_id = row['user_id']
-                settings_dict = {
-                    'user_id': user_id,
-                    'daily_reminders': bool(row['daily_reminders']),
-                    'event_reminders': bool(row['event_reminders']),
-                    'morning_time': row['morning_time'],
-                    'evening_time': row['evening_time'],
-                    'event_reminder_minutes': row['event_reminder_minutes'],
-                    'timezone': row['timezone'],
-                    'course_code': row['course_code'],
-                    'created_at': row['created_at'],
-                    'updated_at': row['updated_at']
-                }
-                self.settings[user_id] = UserSettings(**settings_dict)
-            
-            conn.close()
-            logger.info(f"Loaded settings for {len(self.settings)} users from database")
+            logger.info(f"Loaded settings for {len(self.settings)} users from MongoDB")
         except Exception as e:
-            logger.error(f"Failed to load settings: {e}")
+            logger.error(f"Failed to load settings from MongoDB: {e}")
             self.settings = {}
     
     def save_settings(self):
-        """Save all settings to database (legacy method for compatibility)"""
-        # Individual saves happen in update_user_setting, but keep this for compatibility
+        """Legacy method for compatibility - individual saves happen in update_user_setting"""
         pass
     
     def _save_user_to_db(self, settings: UserSettings):
-        """Save a single user's settings to database"""
+        """Save a single user's settings to MongoDB"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            settings_dict = asdict(settings)
             
-            cursor.execute("""
-                INSERT OR REPLACE INTO user_settings 
-                (user_id, daily_reminders, event_reminders, morning_time, evening_time, 
-                 event_reminder_minutes, timezone, course_code, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                settings.user_id,
-                int(settings.daily_reminders),
-                int(settings.event_reminders),
-                settings.morning_time,
-                settings.evening_time,
-                settings.event_reminder_minutes,
-                settings.timezone,
-                settings.course_code,
-                settings.created_at,
-                settings.updated_at
-            ))
+            self.collection.update_one(
+                {"user_id": settings.user_id},
+                {"$set": settings_dict},
+                upsert=True
+            )
             
-            conn.commit()
-            conn.close()
-            logger.debug(f"Saved settings for user {settings.user_id} to database")
+            logger.debug(f"Saved settings for user {settings.user_id} to MongoDB")
         except Exception as e:
-            logger.error(f"Failed to save settings to database: {e}")
+            logger.error(f"Failed to save settings to MongoDB: {e}")
     
     def get_user_settings(self, user_id: int, auto_detect_timezone: bool = True) -> UserSettings:
         """Get settings for a user, create default if not exists"""
@@ -198,7 +150,7 @@ class UserSettingsManager:
                 setattr(settings, key, value)
         settings.updated_at = datetime.now().isoformat()
         
-        # Save to database immediately
+        # Save to MongoDB immediately
         self._save_user_to_db(settings)
         logger.info(f"Updated settings for user {user_id}: {kwargs}")
     
