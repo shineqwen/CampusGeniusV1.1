@@ -1,14 +1,15 @@
+import json
 import logging
 import os
+import subprocess
 from datetime import datetime
 from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict
 from zoneinfo import ZoneInfo
-from pymongo import MongoClient
 
 logger = logging.getLogger("alfred.user_settings")
 
-# UTC-based timezone choices for settings UI (offset-based)
+# UTC-based timezone choices
 UTC_TIMEZONES = [
     {"name": "UTC", "offset": 0, "tz": "UTC"},
     {"name": "UTC+1", "offset": 1, "tz": "Europe/London"},
@@ -58,7 +59,6 @@ class UserSettings:
         self.updated_at = datetime.now().isoformat()
     
     def get_timezone(self) -> ZoneInfo:
-        """Get timezone object, fallback to UTC if invalid"""
         try:
             return ZoneInfo(self.timezone)
         except Exception:
@@ -66,102 +66,70 @@ class UserSettings:
             return ZoneInfo("UTC")
 
 class UserSettingsManager:
-    def __init__(self, mongodb_uri: str = None):
-        """Initialize with MongoDB connection (lazy loading)"""
-        if mongodb_uri is None:
-            mongodb_uri = os.getenv("MONGODB_URI")
-        
-        if not mongodb_uri:
-            raise ValueError("MONGODB_URI environment variable not set")
-        
-        self.mongodb_uri = mongodb_uri
-        self.client = None
-        self.db = None
-        self.collection = None
+    def __init__(self, settings_file: str = "user_settings.json"):
+        self.settings_file = settings_file
         self.settings: Dict[int, UserSettings] = {}
-        
-        # Don't connect immediately - connect on first use
-        logger.info("MongoDB connection initialized (will connect on first use)")
+        self.auto_commit = os.getenv("AUTO_COMMIT_DATA", "false").lower() == "true"
+        self.load_settings()
     
-    def _ensure_connection(self):
-        """Ensure MongoDB connection is established"""
-        if self.client is None:
-            try:
-                # Use more compatible connection settings
-                self.client = MongoClient(
-                    self.mongodb_uri,
-                    serverSelectionTimeoutMS=5000,
-                    connectTimeoutMS=10000,
-                    socketTimeoutMS=10000,
-                    tls=True,
-                    tlsAllowInvalidCertificates=True
-                )
-                self.db = self.client.get_database("campus_genius_bot")
-                self.collection = self.db.user_settings
-                
-                # Test connection
-                self.client.admin.command('ping')
-                
-                # Create index on user_id for faster queries
-                self.collection.create_index("user_id", unique=True)
-                
-                logger.info("Connected to MongoDB successfully")
-                
-                # Load settings after successful connection
-                self.load_settings()
-            except Exception as e:
-                logger.error(f"Failed to connect to MongoDB: {e}")
-                # Use in-memory fallback
-                logger.warning("Using in-memory storage - data will not persist!")
-                self.settings = {}
-    
-    def load_settings(self):
-        """Load all user settings from MongoDB into memory"""
-        if self.collection is None:
+    def _git_commit_and_push(self):
+        """Commit settings file to git (if AUTO_COMMIT_DATA is enabled)"""
+        if not self.auto_commit:
             return
         
         try:
-            documents = self.collection.find()
+            # Configure git
+            subprocess.run(["git", "config", "user.name", "Railway Bot"], check=False)
+            subprocess.run(["git", "config", "user.email", "bot@railway.app"], check=False)
             
-            for doc in documents:
-                user_id = doc['user_id']
-                # Remove MongoDB's _id field
-                doc.pop('_id', None)
-                
-                self.settings[user_id] = UserSettings(**doc)
+            # Add, commit, and push
+            subprocess.run(["git", "add", self.settings_file], check=False)
+            subprocess.run(["git", "commit", "-m", f"Auto-update user settings - {datetime.now().isoformat()}"], check=False)
+            subprocess.run(["git", "push"], check=False)
             
-            logger.info(f"Loaded settings for {len(self.settings)} users from MongoDB")
+            logger.info("Settings committed to git successfully")
         except Exception as e:
-            logger.error(f"Failed to load settings from MongoDB: {e}")
+            logger.warning(f"Failed to commit settings to git: {e}")
+    
+    def load_settings(self):
+        """Load user settings from file"""
+        try:
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for user_id_str, settings_dict in data.items():
+                        user_id = int(user_id_str)
+                        if 'course_code' not in settings_dict:
+                            settings_dict['course_code'] = 'BS1'
+                        if 'daily_reminders' not in settings_dict:
+                            settings_dict['daily_reminders'] = True
+                        if 'event_reminders' not in settings_dict:
+                            settings_dict['event_reminders'] = True
+                        self.settings[user_id] = UserSettings(**settings_dict)
+                logger.info(f"Loaded settings for {len(self.settings)} users")
+            else:
+                logger.info("No settings file found, starting fresh")
+        except Exception as e:
+            logger.error(f"Failed to load settings: {e}")
             self.settings = {}
     
     def save_settings(self):
-        """Legacy method for compatibility - individual saves happen in update_user_setting"""
-        pass
-    
-    def _save_user_to_db(self, settings: UserSettings):
-        """Save a single user's settings to MongoDB"""
-        self._ensure_connection()
-        
-        if self.collection is None:
-            logger.warning("MongoDB not connected - settings not persisted")
-            return
-        
+        """Save user settings to file"""
         try:
-            settings_dict = asdict(settings)
+            data = {}
+            for user_id, settings in self.settings.items():
+                data[str(user_id)] = asdict(settings)
             
-            self.collection.update_one(
-                {"user_id": settings.user_id},
-                {"$set": settings_dict},
-                upsert=True
-            )
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            logger.debug(f"Saved settings for {len(self.settings)} users")
             
-            logger.debug(f"Saved settings for user {settings.user_id} to MongoDB")
+            # Auto-commit if enabled
+            self._git_commit_and_push()
         except Exception as e:
-            logger.error(f"Failed to save settings to MongoDB: {e}")
+            logger.error(f"Failed to save settings: {e}")
     
     def get_user_settings(self, user_id: int, auto_detect_timezone: bool = True) -> UserSettings:
-        """Get settings for a user, create default if not exists"""
         if user_id not in self.settings:
             default_tz = "Europe/London"
             
@@ -172,32 +140,25 @@ class UserSettingsManager:
                 daily_reminders=True,
                 event_reminders=True
             )
-            self._save_user_to_db(self.settings[user_id])
-        
+            self.save_settings()
         return self.settings[user_id]
     
     def update_user_setting(self, user_id: int, **kwargs):
-        """Update specific user settings"""
         settings = self.get_user_settings(user_id)
         for key, value in kwargs.items():
             if hasattr(settings, key):
                 setattr(settings, key, value)
         settings.updated_at = datetime.now().isoformat()
-        
-        # Save to MongoDB immediately
-        self._save_user_to_db(settings)
+        self.save_settings()
         logger.info(f"Updated settings for user {user_id}: {kwargs}")
     
     def get_users_with_daily_reminders(self) -> List[UserSettings]:
-        """Get all users with daily reminders enabled"""
         return [settings for settings in self.settings.values() if settings.daily_reminders]
     
     def get_users_with_event_reminders(self) -> List[UserSettings]:
-        """Get all users with event reminders enabled"""
         return [settings for settings in self.settings.values() if settings.event_reminders]
     
     def is_valid_timezone(self, timezone_str: str) -> bool:
-        """Check if timezone string is valid"""
         try:
             ZoneInfo(timezone_str)
             return True
@@ -205,11 +166,9 @@ class UserSettingsManager:
             return False
     
     def get_common_timezones(self) -> List[dict]:
-        """Get list of UTC-based timezones for UI"""
         return UTC_TIMEZONES
     
     def get_timezone_page(self, page: int = 0, per_page: int = 5) -> tuple[List[dict], int, bool, bool]:
-        """Get timezone page with pagination info"""
         total_timezones = len(UTC_TIMEZONES)
         total_pages = (total_timezones + per_page - 1) // per_page
         
@@ -224,11 +183,9 @@ class UserSettingsManager:
         return page_timezones, total_pages, has_prev, has_next
     
     def detect_user_timezone_from_telegram(self, user) -> str:
-        """Try to detect user timezone from Telegram data"""
         return "Europe/London"
     
     def search_timezones(self, query: str, limit: int = 10) -> List[dict]:
-        """Search for timezones matching query"""
         query_lower = query.lower()
         matches = []
         
@@ -241,14 +198,11 @@ class UserSettingsManager:
         return matches
     
     def is_valid_course(self, course_code: str) -> bool:
-        """Check if course code is valid"""
         return course_code in ["BS1"]
     
     def get_available_courses(self) -> List[dict]:
-        """Get available course codes and names"""
         return [
             {"code": "BS1", "name": "Bachelor of Science in Business Studies (Year 1)"}
         ]
 
-# Global settings manager instance
 settings_manager = UserSettingsManager()
