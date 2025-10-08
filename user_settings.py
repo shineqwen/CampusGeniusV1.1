@@ -77,17 +77,39 @@ class UserSettingsManager:
         if not self.auto_commit:
             return
         
+        github_token = os.getenv("GITHUB_TOKEN")
+        if not github_token:
+            logger.warning("GITHUB_TOKEN not set - cannot auto-commit")
+            return
+        
         try:
+            # Set up git credentials using token
+            github_repo = os.getenv("GITHUB_REPO", "")
+            if github_repo:
+                # Replace https:// with https://TOKEN@
+                auth_repo = github_repo.replace("https://", f"https://{github_token}@")
+                subprocess.run(["git", "remote", "set-url", "origin", auth_repo], check=False)
+            
             # Configure git
             subprocess.run(["git", "config", "user.name", "Railway Bot"], check=False)
             subprocess.run(["git", "config", "user.email", "bot@railway.app"], check=False)
             
+            # Check if there are changes
+            result = subprocess.run(["git", "status", "--porcelain", self.settings_file], 
+                                  capture_output=True, text=True, check=False)
+            
+            if not result.stdout.strip():
+                logger.debug("No changes to commit")
+                return
+            
             # Add, commit, and push
-            subprocess.run(["git", "add", self.settings_file], check=False)
-            subprocess.run(["git", "commit", "-m", f"Auto-update user settings - {datetime.now().isoformat()}"], check=False)
-            subprocess.run(["git", "push"], check=False)
+            subprocess.run(["git", "add", self.settings_file], check=True)
+            subprocess.run(["git", "commit", "-m", f"Auto-update user settings - {datetime.now().isoformat()}"], check=True)
+            subprocess.run(["git", "push", "origin", "HEAD:main"], check=True)
             
             logger.info("Settings committed to git successfully")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Git command failed: {e}")
         except Exception as e:
             logger.warning(f"Failed to commit settings to git: {e}")
     
